@@ -197,7 +197,7 @@ static void prvTaskExitError( void )
 
 6. 调度开始,当前执行任务就是删除任务,执行一次`Yield`操作,即去产生一次调度
 
-## 2.3 任务挂起
+## 2.3 内核任务挂起
 
 1. uxSchedulerSuspended+1
 > https://www.freertos.org/FreeRTOS_Support_Forum_Archive/September_2013/freertos_Concerns_about_the_atomicity_of_vTaskSuspendAll_d165e9c3j.html
@@ -219,7 +219,7 @@ xuSchedulerSuspended 变量...
 将寄存器存储到 uxSchedulerSuspendeded 中
 ```
 
-## 2.4 任务恢复
+## 2.4 内核任务恢复
 
 1. uxSchedulerSuspended必须为0,才能进行任务调度
 
@@ -228,3 +228,42 @@ xuSchedulerSuspended 变量...
 3. 移除所用于的事件链表和状态链表
 
 4. 就绪链表任务 > 当前任务优先级,执行`Yield`调度
+
+## 2.5 任务延时挂起
+
+1. 将任务从就绪列表中删除，然后再将其添加到阻止列表中,因为两个列表使用相同的列表项.
+2. 如果延时时间是永久,将任务添加到挂起任务列表中，而不是延迟任务列表以确保它不会被定时事件唤醒。 它会无限期阻塞。
+3. 否则,根据当前tick计算下一次唤醒时间,插入就绪链表中;
+4. 如果溢出,则插入溢出延时链表中
+
+## 2.6 空闲线程
+
+1. 检查并清除已删除的任务
+2. 低功耗 TICKLESS 功能
+
+- 获取预期空闲时间
+  1. 当前任务优先级 > 空闲线程,即还需要退出空闲线程 -> 不需要空闲时间
+  2. 处于就绪状态的任务的优先级高于空闲优先 -> 不需要空闲时间
+  3. 其余情况 空闲时间 = 下一个解锁时间 - 当前tick时间
+
+- 预期空闲时间
+  1. 设定的最小进入低功耗时间
+  2. 进入低功耗
+  3. 设置SYSTICK下一次唤醒时间
+  4. 唤醒后计算任务补偿时间
+- 完成低功耗进退过程	
+
+## 2.7 任务启动
+
+1. 创建空闲线程
+2. 创建定时器线程
+
+3. 关闭中断，以确保不会发生SYStcik中断.
+4. 硬件调度启动`xPortStartScheduler`
+
+- 使PendSV和SysTick成为最低优先级中断，并使SVCall最高优先级
+- 设置SYSTICK定时器和所需的频率
+
+- 启动第一个任务
+
+### 3. 
