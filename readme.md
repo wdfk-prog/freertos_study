@@ -287,3 +287,153 @@ xuSchedulerSuspended 变量...
 1. 创建定时器线程
 2. 线程中接收队列命令进行处理并执行回调
 
+
+# 5.PORT
+
+## 5.1 栈初始化
+
+```c
+StackType_t * pxPortInitialiseStack( StackType_t * pxTopOfStack,
+                                     TaskFunction_t pxCode,
+                                     void * pvParameters )
+{
+    /* Simulate the stack frame as it would be created by a context switch
+     * interrupt. */
+    pxTopOfStack--;                                                      /* Offset added to account for the way the MCU uses the stack on entry/exit of interrupts. */
+    *pxTopOfStack = portINITIAL_XPSR;                                    /* xPSR */
+    pxTopOfStack--;
+    *pxTopOfStack = ( ( StackType_t ) pxCode ) & portSTART_ADDRESS_MASK; /* PC */
+    pxTopOfStack--;
+    *pxTopOfStack = ( StackType_t ) portTASK_RETURN_ADDRESS;             /* LR */
+    pxTopOfStack -= 5;                                                   /* R12, R3, R2 and R1. */
+    *pxTopOfStack = ( StackType_t ) pvParameters;                        /* R0 */
+    pxTopOfStack -= 8;                                                   /* R11, R10, R9, R8, R7, R6, R5 and R4. */
+
+    return pxTopOfStack;
+}
+```
+
+## 5.2 任务退出
+
+任务不允许退出,因为任务退出会破坏任务调度器的数据结构.任务可以调用 vTaskDelete(NULL) 以删除自己.如果任务使用 vTaskDelete() API 函数删除自身,则空闲任务必须有足够的处理时间.这是因为空闲任务负责清理删除自身的任务所使用的内核资源.
+
+```c
+static void prvTaskExitError( void )
+{
+    volatile uint32_t ulDummy = 0UL;
+
+    configASSERT( uxCriticalNesting == ~0UL );
+    portDISABLE_INTERRUPTS();
+
+    while( ulDummy == 0 )
+    {
+    }
+}
+```
+
+## 5.3 进入第一个任务
+
+- 由于进入第一个任务时,并没有`from`任务,所以需要执行不同操作
+
+```assembly
+    ldr r0, =0xE000ED08   //将NVIC偏移寄存器的地址（0xE000ED08）加载到寄存器r0中。NVIC偏移寄存器用于定位堆栈。 
+    ldr r0, [r0]          //读取r0寄存器中的地址处的值，然后将该值加载到r0寄存器中 这个值实际上是一个指向堆栈顶部的指针的地址
+    ldr r0, [r0]          //再次执行上述操作，这是因为堆栈地址存储在两级指针中。这个值就是堆栈顶部的实际地址。
+    msr msp, r0           // 将主堆栈指针（msp）设置回堆栈的开始
+    cpsie i               // 全局启用中断
+    cpsie f               // 启用浮点单元 开启中断和异常，让下面的SVC中断能够响应
+    dsb                   // 数据同步屏障指令，确保在继续执行后续指令之前完成所有内存访问。
+    isb                   // 指令同步屏障，清除流水线，以便所有影响程序状态的指令都可以在后续指令执行之前完成
+    svc 0                 // 执行系统调用以启动第一个任务 触发SVC中断
+    nop                   // 
+    .ltorg
+```
+
+SVC（Supervisor Call）中断，也被称为系统调用中断，是ARM Cortex-M架构中的一种特殊类型的中断。它主要用于在用户模式和内核模式之间进行切换。
+
+在嵌入式系统或实时操作系统（RTOS）中，SVC中断通常用于执行以下操作：
+
+任务切换：当一个任务完成其执行或需要等待某个事件（如I/O操作完成）时，可以通过触发SVC中断来切换到另一个任务。SVC中断处理程序会保存当前任务的上下文（即寄存器的状态），然后恢复下一个任务的上下文，从而实现任务切换。
+系统服务调用：应用程序可以通过触发SVC中断来请求操作系统提供的服务，如内存分配、文件操作等。SVC中断号（在svc指令后的数字）通常用于指定要调用的系统服务。
+权限切换：在更复杂的操作系统中，SVC中断可以用于在用户模式（有限的权限）和内核模式（完全的权限）之间切换。这对于保护系统资源和隔离应用程序错误非常重要。
+
+## 5.4 SVC中断处理
+
+```assembly
+    ldr r3, pxCurrentTCBConst2/* Restore the context. */
+    ldr r1, [r3]              /* Use pxCurrentTCBConst to get the pxCurrentTCB address. */
+    ldr r0, [r1]              /* The first item in pxCurrentTCB is the task top of stack. */
+    ldmia r0!, {r4-r11}       /* Pop the registers that are not automatically saved on exception entry and the critical nesting count. */
+    msr psp, r0               /* Restore the task stack pointer. */
+    isb                       
+    mov r0, #0                // r0 = 0
+    msr basepri, r0           // 设置basepri为0
+    orr r14, #0xd             // r向r14寄存器最后4位按位或上0x0D
+    bx r14                    // 使得硬件在退出时使用进程堆栈指针PSP完成出栈操作并返回后进入线程模式、返回用户级
+                              
+    .align 4                  
+    pxCurrentTCBConst2: .word pxCurrentTCB
+```
+
+- 以r0 为基地址，将栈中向上增长的8个字的内容加载到CPU寄存器r4~r11，同时r0 也会跟着自增。并将自增后的r0赋值给psp
+- 退出中断，由于此时sp指针使用任务指针psp，所以在进行中断退出的出栈操作时，是以psp指针指向地址开始出栈。这一部分均由硬件完成，相应寄存器会被置位，比如PC指针会更新成新任务的入口地址。
+- 至此，pc指针指向任务的函数地址，sp指针(此时为psp)指向任务栈的栈顶，第一个任务成功运行。
+
+## 5.4 调度程序启动
+
+- 使 PendSV 和 SysTick 成为最低优先级中断
+
+- 启动生成tick ISR的定时器
+
+- 初始化关键嵌套计数，为第一个任务做好准备
+
+- 开始第一个任务`prvPortStartFirstTask`
+
+## 5.5 PENdSV中断处理
+
+```assembly
+    mrs r0, psp                         
+    isb                                 
+                                        
+    ldr r3, pxCurrentTCBConst           /* Get the location of the current TCB. */
+    ldr r2, [r3]                        
+                                        
+    stmdb r0!, {r4-r11}                 /* Save the remaining registers. */
+    str r0, [r2]                        /* Save the new top of stack into the first member of the TCB. */
+                                        
+    stmdb sp!, {r3, r14}                
+    mov r0, %0                          
+    msr basepri, r0                     
+    bl vTaskSwitchContext               
+    mov r0, #0                          
+    msr basepri, r0                     
+    ldmia sp!, {r3, r14}                
+                                        /* Restore the context, including the critical nesting count. */
+    ldr r1, [r3]                        
+    ldr r0, [r1]                        /* The first item in pxCurrentTCB is the task top of stack. */
+    ldmia r0!, {r4-r11}                 /* Pop the registers. */
+    msr psp, r0                         
+    isb                                 
+    bx r14                              
+                                        
+    .align 4                            
+    pxCurrentTCBConst: .word pxCurrentTCB
+    ::"i" ( configMAX_SYSCALL_INTERRUPT_PRIORITY )
+```
+
+1. 保存上文部分
+
+-  R0=psp，R3=pxCurrentTCB，R2=pxCurrentTCB->TopOfStack(任务块第一个成员为栈顶地址)，保存它们是为了之后使用。因为在进入PendSV中断时，硬件已经自动将一些寄存器入栈了，所以只需要将R4-R11手动入栈即可。此时的R0指向栈顶，将其保存到R2中，更新当前任务栈的栈顶，方便以后任务切换时调用。
+
+2. 切换下文
+
+- 先执行`vTaskSwitchContext()` -> `taskSELECT_HIGHEST_PRIORITY_TASK`
+首先寻找最高优先级任务,然后使用`listGET_OWNER_OF_NEXT_ENTRY` -> 进行切换同优先级的下一个任务,让同优先级的每一个任务都能拥有相同的执行时间。RT-Thread和μC/OS可以指定时间片的大小为多个tick，但是FreeRTOS不一样，时间片只能 是一个tick。
+
+- 首先是开中断，修改完了pxCurrentTCB要立即打开，不然会影响系统的实时性。之后的操作与入栈如出一辙，值得注意的是，之前R3，R14入栈的作用就在这里体现了，R3始终指向pxCurrentTCB的地址，R14保存的进入中断之前的处理器模式和堆栈指针。
+
+## 5.6 xPortSysTickHandler
+
+1. 调用了vPortSetupTimerInterrupt()来使能系统时钟Systick,主要工作是设置Systick定时器的中断周期和使能Systick中断
+
+2. `xPortSysTickHandler()`函数首先进行关中断处理，然后调用`xTaskIncrementTick()`函数
